@@ -3,11 +3,13 @@ import hmac
 import hashlib
 from .github_api import GitHubAPI
 from .llm_analyzer_lmstudio import CodeAnalyzer
+from .static_analyzer import StaticAnalyzer
 from .config import WEBHOOK_SECRET
 
 app = FastAPI(title="AI Code Reviewer")
 github_api = GitHubAPI()
 analyzer = CodeAnalyzer()
+static_analyzer = StaticAnalyzer()
 
 @app.get("/")
 def read_root():
@@ -17,14 +19,14 @@ def read_root():
 def health_check():
     return {"status": "healthy"}
 
-async def process_review(repo: str, pr_number: int):
+async def process_review(repo, pr_number, head_sha):
     """Process PR review in background"""
     try:
-        print(f"🔍 Starting review for PR #{pr_number} in {repo}")
+        print(f"Starting review for PR #{pr_number} in {repo}...")
         
         # Get changed files
         files = github_api.get_pr_files(repo, pr_number)
-        print(f"📄 Found {len(files)} changed files")
+        print(f"Found {len(files)} changed files---")
         
         # Analyze each file
         reviews = {}
@@ -33,18 +35,43 @@ async def process_review(repo: str, pr_number: int):
             patch = file.get("patch", "")
             
             if patch:
-                print(f"🤖 Analyzing {filename}...")
-                review = analyzer.analyze_code(patch, filename)
-                reviews[filename] = review
+                print(f"Analyzing {filename}...")
+                
+                # Get full file content for static analysis
+                try:
+                    file_content_data = github_api.get_file_contents(repo, filename, ref=head_sha)
+                    import base64
+                    file_content = base64.b64decode(file_content_data['content']).decode('utf-8')
+                    
+                    # Run static analysis
+                    print(f"Running static analysis on {filename}...")
+                    static_results = static_analyzer.analyze_file(filename, file_content)
+                    print(f"   {static_results['summary']}")
+                    
+                    # Format static issues for LLM
+                    static_context = static_analyzer.format_issues_for_llm(static_results)
+                    
+                    # LLM review with static analysis context
+                    review = analyzer.analyze_code(patch, filename, static_context)
+                    reviews[filename] = review
+                    
+                except Exception as e:
+                    print(f"⚠️ Could not get file content for {filename}: {e}")
+                    # Fallback: LLM review without static analysis
+                    review = analyzer.analyze_code(patch, filename)
+                    reviews[filename] = review
         
         # Post review
         if reviews:
-            print(f"💬 Posting review with {len(reviews)} files...")
+            print(f"Posting review with {len(reviews)} files...")
             comment = analyzer.format_review(reviews)
             github_api.post_comment(repo, pr_number, comment)
-            print("✅ Review posted successfully!")
+            print("Review posted successfully!")
         else:
-            print("⚠️ No files to review")
+            print("No files to review")
+        
+        # Cleanup
+        static_analyzer.cleanup()
             
     except Exception as e:
         print(f"❌ Error processing review: {e}")
@@ -53,7 +80,6 @@ async def process_review(repo: str, pr_number: int):
 async def handle_webhook(request: Request, background_tasks: BackgroundTasks):
     """Handle GitHub webhook events"""
     
-    # Read body once (can't read twice!)
     body = await request.body()
     
     # Verify webhook signature (security)
@@ -83,9 +109,10 @@ async def handle_webhook(request: Request, background_tasks: BackgroundTasks):
     # Extract details
     repo = payload["repository"]["full_name"]
     pr_number = pr["number"]
+    head_sha = pr["head"]["sha"]  # Get the commit SHA from the PR head
     
     # Process review in background (don't block webhook response)
-    background_tasks.add_task(process_review, repo, pr_number)
+    background_tasks.add_task(process_review, repo, pr_number, head_sha)
     
     # Return immediately (GitHub won't timeout!)
     return {"message": "Review queued", "pr": pr_number, "repo": repo}
